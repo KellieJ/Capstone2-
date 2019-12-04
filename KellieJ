@@ -1,0 +1,131 @@
+installOrLoad <- function(pkgs){
+    for (pkg in pkgs){
+        if(!require(pkg, character.only=TRUE)){
+            BiocManager::install(pkg)
+            require(pkg, character.only=TRUE)
+        }
+    }
+}
+BiocManager::install("htmltools")
+required.packages <- c("MultiAssayExperiment", "curatedTCGAData", "TCGAutils", "pensim", "penalized", "genefilter", 
+                       "logging", "survival", "GenomicRanges", "Biobase", "survminer", "survivalROC", "impute", "survC1")
+suppressPackageStartupMessages( installOrLoad(required.packages) )
+suppressMessages(
+    OV <- curatedTCGAData::curatedTCGAData("OV", 
+        assays = c("GISTIC_Peaks", "mRNAArray_TX_g4502a_1"), 
+        dry.run = FALSE))
+OV
+
+## complete cases only
+OV <- OV[, complete.cases(OV$days_to_death, OV$vital_status), ]
+## Solid tumor specimens only
+OV <- TCGAutils::splitAssays(OV, "01")
+# match assays
+OV <- MultiAssayExperiment::MatchedAssayExperiment(OV)
+# Replace the `RaggedExperiment` with a matrix
+
+OV[["01_OV_mRNAArray_TX_g4502a_1-20160128"]] <- as.matrix(assay(OV[["01_OV_mRNAArray_TX_g4502a_1-20160128"]]))
+summary(is.na(as.numeric(OV[[1]]))) #now much missingness?
+
+suppressMessages(OV <- imputeAssay(OV, i=1L))
+
+#filter RNA-seq data, keeping the `keep.fraction` fraction of genes with highest variance
+keep.fraction <- 0.3
+#
+data.filt <- assay(OV[["01_OV_mRNAArray_TX_g4502a_1-20160128"]])
+allvars <- apply(data.filt, 1, var)
+highvar <- rank(allvars) > (length(allvars) * (1-keep.fraction) )
+summary(highvar)
+summary(allvars[highvar])
+summary(allvars[!highvar])
+
+OV[["01_OV_mRNAArray_TX_g4502a_1-20160128"]] <- OV[["01_OV_mRNAArray_TX_g4502a_1-20160128"]][highvar, ]
+rm(allvars, highvar)
+OV
+
+nprocessors = 4 # Set the number of processors to be used
+nsim = 4 #number of simulations to be used by pensim (ideally ~40, but this takes longer)
+
+surv.obj <- Surv(OV$days_to_death/365, OV$vital_status)
+names(OV)
+#cd <- as.data.frame(colData(OV)[, c("days_to_death", "vital_status")])
+##survminer::ggsurvplot(fit, data=cd)
+##fit <- survminer::surv_fit(Surv(OV$days_to_death/365, OV$vital_status) ~ 1, data=colData(OV))
+
+microarraydat <- t(assay(OV, "01_OV_mRNAArray_TX_g4502a_1-20160128"))
+gisticdat <- t(assay(OV, "01_OV_GISTIC_Peaks-20160128"))
+bothdat <- as.matrix(wideFormat(OV)[, -1])
+dim(microarraydat)
+dim(gisticdat)
+dim(bothdat) ## of columns equals the sum of the number of columns of microarray and GISTIC
+
+# GISTIC fit
+set.seed(1)
+gisticfit <- optL2(response=surv.obj, penalized=gisticdat, 
+                   fold=5,  positive=FALSE, standardize=TRUE, 
+                   trace=FALSE, minlambda2 = 800)
+                   
+set.seed(1)
+gistic.cv <- opt.nested.crossval(outerfold=5, nsim = nsim, nprocessors = nprocessors, optFUN="opt2D", 
+                                 response=surv.obj, penalized=gisticdat, 
+                                 fold=10, positive=FALSE, standardize=TRUE, trace=FALSE, 
+                                 L2range = c(gisticfit$lambda*0.75, gisticfit$lambda*1.25),
+                                 L2gridsize = 3)
+                                 
+gistic.c <- Est.Cval(mydata = cbind(OV$days_to_death/365, OV$vital_status, gistic.cv), 
+         tau=5.0)
+gistic.c$Dhat
+
+ if(require(survivalROC)){
+nobs <- length(gistic.cv)
+cutoff <- 12
+gistic.roc <- survivalROC(Stime=OV$days_to_death/365, status=OV$vital_status,
+marker=gistic.cv, predict.time=cutoff, span = 0.01*nobs^(-0.20))
+plot(gistic.roc$FP, gistic.roc$TP, type="l", xlim=c(0, 1), ylim=c(0, 1),
+xlab=paste( "False Positive Fraction", "\n", "AUC = ", round(gistic.roc$AUC, 3)),
+lty=2, ylab="True Positive Fraction", main="Ridge Predictions\n ROC curve at 12 months")
+abline(0, 1)
+}
+
+# microarray fit
+set.seed(1)
+microarrayfit <- optL2(response=surv.obj, penalized=microarraydat, 
+                       fold=5, positive=FALSE, standardize=TRUE, 
+                       trace=FALSE, minlambda2=50000)
+                       
+ set.seed(1)
+microarray.cv <- opt.nested.crossval(outerfold=5, nsim = nsim, nprocessors = nprocessors, optFUN="opt2D", 
+                                 response=surv.obj, penalized=microarraydat, 
+                                 fold=10, positive=FALSE, standardize=TRUE, trace=FALSE, 
+                                 L2range = c(microarrayfit$lambda*0.75, microarrayfit$lambda*1.25),
+                                 L2gridsize = 3)
+                                 
+                                 
+microarray.c <- Est.Cval(mydata = cbind(OV$days_to_death/365, OV$vital_status, microarray.cv), 
+         tau=5.0)
+microarray.c$Dhat
+
+if(require(survivalROC)){
+nobs <- length(microarray.cv)
+cutoff <- 12
+microarray.roc <- survivalROC(Stime=OV$days_to_death/365, status=OV$vital_status,
+marker=microarray.cv, predict.time=cutoff, span = 0.01*nobs^(-0.20))
+plot(microarray.roc$FP, microarray.roc$TP, type="l", xlim=c(0, 1), ylim=c(0, 1),
+xlab=paste( "FP", "\n", "AUC = ", round(microarray.roc$AUC, 3)),
+lty=2, ylab="TP", main="Ridge predictions\n ROC curve at 12 months")
+abline(0, 1)
+}
+
+# both fit
+set.seed(1)
+bothfit <- optL2(response=surv.obj, penalized=bothdat, 
+                 fold=5, positive=FALSE, standardize=TRUE, trace=FALSE, minlambda2=50000)
+                 
+set.seed(1)
+both.cv <- opt.nested.crossval(outerfold=5, nsim = nsim, nprocessors = nprocessors, optFUN="opt2D", 
+                               response=surv.obj, penalized=bothdat, 
+                               fold=10, positive=FALSE, standardize=TRUE, trace=FALSE, 
+                               L2range = c(bothfit$lambda*0.75, bothfit$lambda*1.25),
+                               L2gridsize = 3)
+                               
+ 
