@@ -127,5 +127,8 @@ both.cv <- opt.nested.crossval(outerfold=5, nsim = nsim, nprocessors = nprocesso
                                fold=10, positive=FALSE, standardize=TRUE, trace=FALSE, 
                                L2range = c(bothfit$lambda*0.75, bothfit$lambda*1.25),
                                L2gridsize = 3)
-                               
+                          
+ both.c <- Est.Cval(mydata = cbind(OV$days_to_death/365, OV$vital_status, both.cv), 
+         tau=5.0)
+both.c$Dhat
  
